@@ -9,7 +9,7 @@ import java.util.*;
 
 public class JavaRecommendationExample {
 
-    public static class UserTrackInfoRating {
+    public static class UserTrackInfoRating implements Serializable{
         public int User;
         public int Track;
         public int Artist;
@@ -77,9 +77,9 @@ public class JavaRecommendationExample {
 
         //Fill similar users tracks to shared HashMap (SimilarUserID -> List<TrackInfo>)
         JavaRDD<UserTrackInfoRating> similarUsersByTracks = trackRatings
-                .filter(item -> sharedControlUserTracksEvalsHashMap
+                .filter(item -> (sharedControlUserTracksEvalsHashMap
                         .value()
-                        .containsKey(item.Track));
+                        .containsKey(item.Track) && item.User != userID));
         List<UserTrackInfoRating> similarUsersByTracksList = similarUsersByTracks
                 .collect();
         HashMap<Integer, List<UserTrackInfoRating>> similarUserHashMap = new HashMap<>();
