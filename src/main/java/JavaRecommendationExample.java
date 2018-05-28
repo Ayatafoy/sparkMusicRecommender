@@ -108,7 +108,7 @@ public class JavaRecommendationExample {
 
         //Sort users by rating of similarity
         JavaPairRDD<Double, Integer> similarUserSorted = similarUserRatings
-                .sortByKey();
+                .sortByKey(false);
 
         //For each user get sorted users tracks by rating of evaluation this track by control user
         JavaRDD<UserTrackInfoRating> similarUserTrackEval = similarUserSorted
@@ -139,7 +139,7 @@ public class JavaRecommendationExample {
         });
 
         //Sort tracks by rating
-        friendTracksInfo.sort(Comparator.comparing(track -> track.Rating));
+        friendTracksInfo.sort(Collections.reverseOrder(Comparator.comparing(track -> track.Rating)));
         return friendTracksInfo.iterator();
     }
 
