@@ -3,155 +3,199 @@ import org.apache.spark.api.java.JavaPairRDD;
 import org.apache.spark.api.java.JavaRDD;
 import org.apache.spark.api.java.JavaSparkContext;
 import org.apache.spark.broadcast.Broadcast;
-import org.apache.spark.mllib.recommendation.Rating;
 import scala.Tuple2;
 import java.util.*;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public class JavaRecommendationExample {
 
-    public static class UserTrackInfoRating implements Serializable{
-        public int User;
-        public int Track;
-        public int Artist;
-        public double Rating;
-
-        public UserTrackInfoRating(int userId, int trackId, int artistId, double rating){
-            User = userId;
-            Track = trackId;
-            Artist = artistId;
-            Rating = rating;
-        }
-    }
+    public static JavaSparkContext sparkContext;
+    public static int userID = 30;
 
     public static void main(String[] args)  {
-        int userID = 1029;
+        long startTime = System.nanoTime();
         SparkConf conf = new SparkConf()
                 .setAppName("Java Collaborative Filtering Example")
-                .setMaster("local[2]") ;
-        JavaSparkContext sparkContext = new JavaSparkContext(conf);
-        String pathTracks = "/home/cloudera/IdeaProjects/spark/datasetTracks.csv";
-        String pathArtists = "/home/cloudera/IdeaProjects/spark/datasetArtists.csv";
+                .setMaster("local[4]") ;
+        sparkContext = new JavaSparkContext(conf);
+        String pathToTracks = "/home/cloudera/IdeaProjects/spark/dataSetTracks.csv";
+        String pathToArtists = "/home/cloudera/IdeaProjects/spark/dataSetArtists.csv";
 
         //Read data to RDD (UserID, TrackID, ArtistID, TrackRating)
+        List<Integer> listForQualityChecking = new ArrayList();
+        Broadcast<List> sharedListForQualityChecking = sparkContext.broadcast(listForQualityChecking);
+        JavaRDD<IProduct> trackRatingsRDD = getUserTrackInfoRatingJavaRDD(pathToTracks, sharedListForQualityChecking);
+        JavaRDD<IProduct> trackRatingsFilteredRDD = trackRatingsRDD.filter(track -> (!sharedListForQualityChecking.value().contains(track.GetProduct()) || track.GetUser() != userID));
+
+        //Read artists ratings to format (UserID, ArtistID, ArtistRating)
+        JavaRDD<IProduct> artistsRatingsRDD = getArtistsRatingJavaRDD(pathToArtists);
+
+        //Fill control user tracks info to shared HashMap (TrackID -> Rating)
+        Broadcast<HashMap> sharedControlUserTracksRatingsHashMap = getSharedControlUserProductRatings(trackRatingsFilteredRDD);
+
+        //Fill control user artists info to shared HashMap (ArtistID -> Rating)
+        Broadcast<HashMap> sharedControlUserArtistsRatingsHashMap = getSharedControlUserProductRatings(artistsRatingsRDD);
+
+        //Fill similar users tracks to shared HashMap (SimilarUserID -> List<TrackInfo>)
+        JavaRDD<IProduct> similarUsersByTracksRDD = getSimilarUsersByTracksRDD(trackRatingsFilteredRDD, sharedControlUserTracksRatingsHashMap);
+
+        Broadcast<HashMap> sharedSimilarUserTracksHashMap = getSharedSimilarUserTracks(similarUsersByTracksRDD);
+
+        //Transformation RDD from (UserID, TrackID, ArtistID, TrackRating) to (UserID, (TrackID, TrackRating))
+        JavaPairRDD<Integer, Tuple2> similarUsersTracksRatingsRDD = similarUsersByTracksRDD
+                .mapToPair(trackInfo -> new Tuple2(trackInfo.GetUser(), new Tuple2(trackInfo.GetProduct(), trackInfo.GetRating())));
+
+        //Group RDD by userID
+        JavaPairRDD<Integer, Iterable<Tuple2>> similarUsersTrackGroupedRDD = similarUsersTracksRatingsRDD.groupByKey();
+
+        //Calculate Rating Of Similarity Users (RatingOfSimilarity, UserID)
+        JavaPairRDD<Double, Integer> similarUsersRatingsRDD = similarUsersTrackGroupedRDD
+                .mapToPair(userTrackRating -> calculateRatingOfSimilarityUsers(sharedControlUserTracksRatingsHashMap, userTrackRating));
+
+
+        //Sort users by rating of similarity
+        List<Tuple2<Double, Integer>> similarFirstHundreadUsersSortedList = similarUsersRatingsRDD.sortByKey(false).take(100);
+
+        JavaPairRDD<Double, Integer> similarFirstHundreadUsersSortedRDD = sparkContext.parallelizePairs(similarFirstHundreadUsersSortedList);
+        //Fill similar users all tracks list to shared HashMap (SimilarUserID -> List<TrackInfo>)
+        JavaRDD<IProduct> similarUserAllTrackEvalRDD = trackRatingsFilteredRDD
+                .filter(userTrackInfoRating -> sharedSimilarUserTracksHashMap.value().containsKey(userTrackInfoRating.GetUser()));
+        Broadcast<HashMap> sharedSimilarUserAllTracksRatingsHashMap = getSharedSimilarUserTracks(similarUserAllTrackEvalRDD);
+
+
+        //For each user get sorted users tracks by rating of evaluation this track by control user
+        List<List<UserCustomProductRating>> similarUserTracksList = similarFirstHundreadUsersSortedRDD
+                .map(item ->
+                        getSortedUserTracks(sharedControlUserArtistsRatingsHashMap, sharedSimilarUserAllTracksRatingsHashMap, item._2)).collect();
+
+        //Prepare and out recommended tracks
+        List<Integer> resultList = getResultList(similarUserTracksList);
+        AtomicInteger quality = new AtomicInteger();
+
+        resultList.forEach(trackID -> {
+            System.out.println(trackID);
+            if (sharedListForQualityChecking.value().contains(trackID))
+                quality.getAndIncrement();
+        });
+        long endTime = System.nanoTime();
+        System.out.println("Took "+ (endTime - startTime) / 1000000000 + " seconds;");
+        System.out.println("Quality of recommendations: " + quality);
+    }
+
+    private static List<Integer> getResultList(List<List<UserCustomProductRating>> sortedList) {
+        //list(0).sublist(0), list(0).sublist(1), list(1).sublist(0), list(0).sublist(2), list(1).sublist(1), list(2).sublist(0)
+        List resultList = new ArrayList();
+        int i = 0;
+        while (i < sortedList.size()) {
+            int j = 0;
+            while (j <= i) {
+                if (i - j < sortedList.get(j).size() && j < sortedList.size()) {
+                    int productID = sortedList.get(j).get(i - j).GetProduct();
+                    if (!resultList.contains(productID))
+                        resultList.add(productID);
+                    if (resultList.size() == 50)
+                        break;
+                }
+                j++;
+            }
+            if (resultList.size() == 50)
+                break;
+            i++;
+        }
+        return resultList;
+    }
+
+    private static JavaRDD<IProduct> getArtistsRatingJavaRDD(String pathArtists) {
+        JavaRDD<String> input = sparkContext.textFile(pathArtists);
+        return input.map(inputLine -> {
+            String[] array = inputLine.split(",");
+            return new UserProductRating(Integer.parseInt(array[0]),
+                    Integer.parseInt(array[1]),
+                    Double.parseDouble(array[2]));
+        });
+    }
+
+    private static JavaRDD<IProduct> getUserTrackInfoRatingJavaRDD(String pathTracks, Broadcast<List> sharedListForQualityChecking) {
         JavaRDD<String> input = sparkContext.textFile(pathTracks);
-        JavaRDD<UserTrackInfoRating> trackRatings = input
-                .map(line -> {
-                    String[] array = line.split(",");
-                    return new UserTrackInfoRating(
+        final Integer[] counter = {1};
+        return input
+                .map(inputLine -> {
+                    String[] array = inputLine.split(",");
+                    if (Integer.parseInt(array[0]) == userID && counter[0] % 2 == 0)
+                        sharedListForQualityChecking.value().add(Integer.parseInt(array[1]));
+                    counter[0]++;
+                    return new UserCustomProductRating(
                             Integer.parseInt(array[0]),
                             Integer.parseInt(array[1]),
                             Integer.parseInt(array[2]),
                             Double.parseDouble(array[3]));
                 });
-
-        //Fill control user tracks info to shared HashMap (TrackID -> Rating)
-        List<UserTrackInfoRating> controlUserTracksRatings = trackRatings
-                .filter(item -> (item.User == userID))
-                .collect();
-        HashMap<Integer, Double> controlUserTracksEvals = new HashMap<>();
-        for (UserTrackInfoRating rating : controlUserTracksRatings) {
-            controlUserTracksEvals.put(rating.Track, rating.Rating);
-        }
-        Broadcast<HashMap> sharedControlUserTracksEvalsHashMap = sparkContext
-                .broadcast(controlUserTracksEvals);
-
-        //Read data to format (UserID, ArtistID, ArtistRating)
-        input = sparkContext.textFile(pathArtists);
-        JavaRDD<Rating> artistsRatings = input.map(line -> {
-            String[] array = line.split(",");
-            return new Rating(Integer.parseInt(array[0]),
-                    Integer.parseInt(array[1]),
-                    Double.parseDouble(array[2]));
-        });
-
-        //Fill control user artists info to shared HashMap (ArtistID -> Rating)
-        List<Rating> controlUserArtistsRatings = artistsRatings
-                .filter(item -> (item.user() == userID))
-                .collect();
-        HashMap<Integer, Double> controlUserAtristsEvals = new HashMap<>();
-        for (Rating rating : controlUserArtistsRatings) {
-            controlUserAtristsEvals.put(rating.product(), rating.rating());
-        }
-        Broadcast<HashMap> sharedControlUserArtistsEvalsHashMap = sparkContext
-                .broadcast(controlUserAtristsEvals);
-
-        //Fill similar users tracks to shared HashMap (SimilarUserID -> List<TrackInfo>)
-        JavaRDD<UserTrackInfoRating> similarUsersByTracks = trackRatings
-                .filter(item -> (sharedControlUserTracksEvalsHashMap
-                        .value()
-                        .containsKey(item.Track) && item.User != userID));
-        List<UserTrackInfoRating> similarUsersByTracksList = similarUsersByTracks
-                .collect();
-        HashMap<Integer, List<UserTrackInfoRating>> similarUserHashMap = new HashMap<>();
-        for (UserTrackInfoRating trackInfo : similarUsersByTracksList) {
-            if (similarUserHashMap.get(trackInfo.User) == null){
-                similarUserHashMap.put(trackInfo.User, new ArrayList<>());
-            }
-            similarUserHashMap.get(trackInfo.User).add(trackInfo);
-        }
-        Broadcast<HashMap> sharedSimilarUserTracksHashMap = sparkContext
-                .broadcast(similarUserHashMap);
-
-        //Transformation RDD from (UserID, TrackID, ArtistID, TrackRating)
-        //to (UserID, TrackID, TrackRating)
-        JavaPairRDD<Integer, Tuple2> similarUsersTracksEvals = similarUsersByTracks
-                .mapToPair(item -> new Tuple2(item.User, new Tuple2(item.Track, item.Rating)));
-
-        //Group RDD by userID
-        JavaPairRDD<Integer, Iterable<Tuple2>> similarUsersTrackGrouped = similarUsersTracksEvals
-                .groupByKey();
-
-        //Calculate Rating Of Similarity Users (RatingOfSimilarity, UserID)
-        JavaPairRDD<Double, Integer> similarUserRatings = similarUsersTrackGrouped
-                .mapToPair(item ->
-                        calculateRatingOfSimilarityUsers(sharedControlUserArtistsEvalsHashMap, item));
-
-        //Sort users by rating of similarity
-        JavaPairRDD<Double, Integer> similarUserSorted = similarUserRatings
-                .sortByKey(false);
-
-        //For each user get sorted users tracks by rating of evaluation this track by control user
-        JavaRDD<UserTrackInfoRating> similarUserTrackEval = similarUserSorted
-                .flatMap(item ->
-                    getSortedUserTracks(sharedControlUserArtistsEvalsHashMap, sharedSimilarUserTracksHashMap, item._2));
-
-        //Prepare and out recommended tracks
-        List<Integer> result = similarUserTrackEval.map(item -> item.Track).collect();
-        result.forEach(item -> System.out.println(item));
     }
 
-    private static Iterator<UserTrackInfoRating> getSortedUserTracks(
-            Broadcast<HashMap> sharedControlUserArtistsEvalsHashMap,
-            Broadcast<HashMap> sharedSimilarUserTracksHashMap,
+    private static Broadcast<HashMap> getSharedSimilarUserTracks(JavaRDD<IProduct> similarUsersByTracksRDD) {
+        List<IProduct> similarUsersByTracksList = similarUsersByTracksRDD.collect();
+        HashMap<Integer, List<IProduct>> similarUserHashMap = new HashMap<>();
+        similarUsersByTracksList.forEach(similarUserTrackInfo -> {
+            if (similarUserHashMap.get(similarUserTrackInfo.GetUser()) == null){
+                similarUserHashMap.put(similarUserTrackInfo.GetUser(), new ArrayList<>());
+            }
+            similarUserHashMap.get(similarUserTrackInfo.GetUser()).add(similarUserTrackInfo);
+        });
+        return sparkContext.broadcast(similarUserHashMap);
+    }
+
+    private static Broadcast<HashMap> getSharedControlUserProductRatings(JavaRDD<IProduct> productRatingsRDD) {
+        List<IProduct> controlUserProductRatingsList = productRatingsRDD
+                .filter(userProductInfo -> (userProductInfo.GetUser() == userID))
+                .collect();
+        HashMap<Integer, Double> controlUserProductRatingsHashMap = new HashMap<>();
+        controlUserProductRatingsList.forEach(userProductInfo -> controlUserProductRatingsHashMap.put(userProductInfo.GetProduct(), userProductInfo.GetRating()));
+        return sparkContext.broadcast(controlUserProductRatingsHashMap);
+    }
+
+    private static JavaRDD<IProduct> getSimilarUsersByTracksRDD(JavaRDD<IProduct> trackRatingsRDD, Broadcast<HashMap> sharedControlUserTracksRatingsHashMap) {
+        return trackRatingsRDD
+                    .filter(userTrackInfo -> (sharedControlUserTracksRatingsHashMap
+                            .value()
+                            .containsKey(userTrackInfo.GetProduct()) && userTrackInfo.GetUser() != userID));
+    }
+
+
+    private static List<UserCustomProductRating> getSortedUserTracks(
+            Broadcast<HashMap> sharedControlUserArtistsRatingsHashMap,
+            Broadcast<HashMap> sharedSimilarUserAllTracksRatingsHashMap,
             Integer userId) {
+
         //Read user List<TrackInfo> from shared hashMap
-        ArrayList<UserTrackInfoRating> friendTracksInfo = (ArrayList<UserTrackInfoRating>)
-                sharedSimilarUserTracksHashMap
+        ArrayList<UserCustomProductRating> friendTracksInfoList = (ArrayList<UserCustomProductRating>)
+                sharedSimilarUserAllTracksRatingsHashMap
                         .value()
                         .get(userId);
 
-        //For each tracks calculate control user evaluation of this track
-        friendTracksInfo.forEach(track -> {
-            track.Rating = 0.0;
-            if (sharedControlUserArtistsEvalsHashMap.value().containsKey(track.Artist)){
-                track.Rating = Math.log((double) sharedControlUserArtistsEvalsHashMap.value().get(track.Artist));
+        //For each tracks calculate control user rating of this track and norm this rating by natural logarithm
+        friendTracksInfoList.forEach(userTrackInfo -> {
+            userTrackInfo.SetRating(0.0);
+            if (sharedControlUserArtistsRatingsHashMap.value().containsKey(userTrackInfo.GetProductAttribute())){
+                userTrackInfo.SetRating((double) sharedControlUserArtistsRatingsHashMap.value().get(userTrackInfo.GetProductAttribute()));
             }
         });
 
         //Sort tracks by rating
-        friendTracksInfo.sort(Collections.reverseOrder(Comparator.comparing(track -> track.Rating)));
-        return friendTracksInfo.iterator();
+        friendTracksInfoList.sort(Collections.reverseOrder(Comparator.comparing(userTrackInfo -> userTrackInfo.GetRating())));
+        return friendTracksInfoList;
     }
 
     private static Tuple2<Double, Integer> calculateRatingOfSimilarityUsers(
-            Broadcast<HashMap> sharedControlUserArtistsEvalsHashMap,
+            Broadcast<HashMap> sharedControlUserTracksEvalsHashMap,
             Tuple2<Integer, Iterable<Tuple2>> userTracks) {
+
+        //Calculate rating of similarity users with control user
         Iterator tracks = userTracks._2.iterator();
         double resultEval = 0.0;
         while (tracks.hasNext()){
             Tuple2 productEval = (Tuple2) tracks.next();
             double friendUserEval = (double) productEval._2;
-            double controlUserEval = (double) sharedControlUserArtistsEvalsHashMap.value().get(productEval._1);
+            double controlUserEval = (double) sharedControlUserTracksEvalsHashMap.value().get(productEval._1);
             resultEval += friendUserEval + controlUserEval - Math.abs(friendUserEval - controlUserEval);
         }
         return new Tuple2(resultEval, userTracks._1);
